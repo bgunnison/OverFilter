@@ -76,6 +76,14 @@ void OverFilterEngine::setWetDry(double wetDry) {
     wetDryTarget_ = std::clamp(wetDry, 0.0, 1.0);
 }
 
+void OverFilterEngine::setGlobalBypass(bool bypass) {
+    globalBypass_ = bypass;
+}
+
+void OverFilterEngine::setOutputMute(bool mute) {
+    outputMute_ = mute;
+}
+
 double OverFilterEngine::softClip(double x) {
     if (!std::isfinite(x)) return 0.0;
     return std::tanh(std::clamp(x, -8.0, 8.0));
@@ -94,6 +102,23 @@ double OverFilterEngine::feedbackSeed(double maxFeedback) {
 void OverFilterEngine::processSample(double inL, double inR, double& outL, double& outR) {
     const double inputL = std::isfinite(inL) ? std::clamp(inL, -8.0, 8.0) : 0.0;
     const double inputR = std::isfinite(inR) ? std::clamp(inR, -8.0, 8.0) : 0.0;
+
+    if (outputMute_) {
+        feedbackL_ = 0.0;
+        feedbackR_ = 0.0;
+        outL = 0.0;
+        outR = 0.0;
+        return;
+    }
+
+    if (globalBypass_) {
+        feedbackL_ = 0.0;
+        feedbackR_ = 0.0;
+        wetDryCurrent_ = wetDryTarget_;
+        outL = inputL;
+        outR = inputR;
+        return;
+    }
 
     int feedbackFilters = 0;
     double maxFeedback = 0.0;

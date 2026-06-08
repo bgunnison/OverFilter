@@ -134,6 +134,17 @@ void toAscii(TChar* src, char* dst, size_t dstSize) {
     ustr.toAscii(dst, static_cast<int32>(dstSize));
 }
 
+const char* modeLabel(TuningMode mode) {
+    switch (mode) {
+        case TuningMode::Note: return "Note";
+        case TuningMode::MidiNote: return "MIDI Note";
+        case TuningMode::MidiChord: return "MIDI Chord";
+        case TuningMode::FixedHz:
+        default:
+            return "Fixed Hz";
+    }
+}
+
 } // namespace
 
 tresult PLUGIN_API OverFilterController::initialize(FUnknown* context) {
@@ -153,11 +164,13 @@ tresult PLUGIN_API OverFilterController::initialize(FUnknown* context) {
 
     addParam("Filter Select", kParamFilterSelect, 0.0, ParameterInfo::kIsHidden, kMaxFilters - 1);
     addParam("Wet/Dry", kParamWetDry, defaultNormalized(kParamWetDry), ParameterInfo::kCanAutomate);
+    addParam("Global Bypass", kParamGlobalBypass, defaultNormalized(kParamGlobalBypass), ParameterInfo::kCanAutomate, 1);
+    addParam("Output Mute", kParamGlobalMute, defaultNormalized(kParamGlobalMute), ParameterInfo::kCanAutomate, 1);
 
     auto addActive = [&](const char* title, int activeSlot, ParamValue def, int32 stepCount = 0) {
         addParam(title, activeParamId(activeSlot), def, ParameterInfo::kIsHidden, stepCount);
     };
-    addActive("Mode", kActiveMode, defaultNormalized(activeParamId(kActiveMode)), 1);
+    addActive("Mode", kActiveMode, defaultNormalized(activeParamId(kActiveMode)), 3);
     addActive("Tune", kActiveTune, defaultNormalized(activeParamId(kActiveTune)));
     addActive("Gain", kActiveGain, defaultNormalized(activeParamId(kActiveGain)));
     addActive("Q", kActiveQ, defaultNormalized(activeParamId(kActiveQ)));
@@ -174,7 +187,7 @@ tresult PLUGIN_API OverFilterController::initialize(FUnknown* context) {
             addParam(title, filterParamId(filter, slot), defaultNormalized(filterParamId(filter, slot)),
                      flags, stepCount);
         };
-        addFilter("Mode", kSlotMode, 1);
+        addFilter("Mode", kSlotMode, 3);
         addFilter("Tune", kSlotTune);
         addFilter("Gain", kSlotGain);
         addFilter("Q", kSlotQ);
@@ -265,11 +278,14 @@ void OverFilterController::buildParamOrder() {
         }
     }
     paramOrder_.push_back(kParamWetDry);
+    paramOrder_.push_back(kParamGlobalBypass);
+    paramOrder_.push_back(kParamGlobalMute);
 }
 
 ParamValue OverFilterController::defaultNormalized(ParamID pid) const {
     if (pid == kParamFilterSelect) return 0.0;
     if (pid == kParamWetDry) return 1.0;
+    if (pid == kParamGlobalBypass || pid == kParamGlobalMute) return 0.0;
     if (pid >= kActiveParamBase && pid < kActiveParamBase + kActiveParamCount) {
         const int activeSlot = static_cast<int>(pid - kActiveParamBase);
         return overfilter::defaultNormalized(0, activeSlotToFilterSlot(activeSlot));
@@ -326,9 +342,9 @@ void OverFilterController::updateTuneForModeChange(ParamID modePid, TuningMode p
     const ParamID perFilterTuneId = filterParamId(filter, kSlotTune);
     const ParamValue currentTune = getParamNormalized(perFilterTuneId);
     ParamValue convertedTune = currentTune;
-    if (previousMode == TuningMode::Note && nextMode == TuningMode::FixedHz) {
+    if (previousMode != TuningMode::FixedHz && nextMode == TuningMode::FixedHz) {
         convertedTune = fixedFrequencyToNormalized(midiNoteToFrequency(normalizedToMidiNote(currentTune)));
-    } else if (previousMode == TuningMode::FixedHz && nextMode == TuningMode::Note) {
+    } else if (previousMode == TuningMode::FixedHz && nextMode != TuningMode::FixedHz) {
         convertedTune = midiNoteToNormalized(frequencyToNearestMidiNote(normalizedToFixedFrequency(currentTune)));
     }
     convertedTune = clamp01(convertedTune);
@@ -378,7 +394,7 @@ void OverFilterController::pushAllParamsToProcessor() {
     pushingToProcessor_ = true;
     pendingProcessorSync_ = false;
     for (auto pid : paramOrder_) {
-        if (pid >= kActiveParamBase) continue;
+        if (pid >= kActiveParamBase && pid < kActiveParamBase + kActiveParamCount) continue;
         const ParamValue value = getParamNormalized(pid);
         componentHandler->beginEdit(pid);
         componentHandler->performEdit(pid, value);
@@ -495,10 +511,14 @@ tresult PLUGIN_API OverFilterController::getParamStringByValue(ParamID pid, Para
         std::snprintf(text, sizeof(text), "%d", filterIndexFromSelectNormalized(valueNormalized) + 1);
     } else if (pid == kParamWetDry) {
         std::snprintf(text, sizeof(text), "%.0f%%", 100.0 * clamp01(valueNormalized));
+    } else if (pid == kParamGlobalBypass) {
+        std::snprintf(text, sizeof(text), "%s", normalizedToBool(valueNormalized) ? "Bypass" : "On");
+    } else if (pid == kParamGlobalMute) {
+        std::snprintf(text, sizeof(text), "%s", normalizedToBool(valueNormalized) ? "Mute" : "On");
     } else if (slot == kSlotMode) {
-        std::snprintf(text, sizeof(text), "%s", normalizedToMode(valueNormalized) == TuningMode::Note ? "Note" : "Fixed Hz");
+        std::snprintf(text, sizeof(text), "%s", modeLabel(normalizedToMode(valueNormalized)));
     } else if (slot == kSlotTune) {
-        if (modeForParam(pid) == TuningMode::Note) {
+        if (modeForParam(pid) != TuningMode::FixedHz) {
             const auto note = noteStringForMidi(normalizedToMidiNote(valueNormalized));
             std::snprintf(text, sizeof(text), "%s", note.c_str());
         } else {
@@ -546,8 +566,24 @@ tresult PLUGIN_API OverFilterController::getParamValueByString(ParamID pid, TCha
             return kResultOk;
         }
     }
+    if (pid == kParamGlobalBypass) {
+        valueNormalized = (s.find("BYPASS") != std::string::npos || s == "1") ? 1.0 : 0.0;
+        return kResultOk;
+    }
+    if (pid == kParamGlobalMute) {
+        valueNormalized = (s.find("MUTE") != std::string::npos || s == "1") ? 1.0 : 0.0;
+        return kResultOk;
+    }
     if (slot == kSlotMode) {
-        valueNormalized = s.find("NOTE") != std::string::npos ? 1.0 : 0.0;
+        if (s.find("CHORD") != std::string::npos) {
+            valueNormalized = modeToNormalized(TuningMode::MidiChord);
+        } else if (s.find("MIDI") != std::string::npos) {
+            valueNormalized = modeToNormalized(TuningMode::MidiNote);
+        } else if (s.find("NOTE") != std::string::npos) {
+            valueNormalized = modeToNormalized(TuningMode::Note);
+        } else {
+            valueNormalized = modeToNormalized(TuningMode::FixedHz);
+        }
         return kResultOk;
     }
     if (slot == kSlotTune) {

@@ -99,5 +99,11 @@ add_custom_command(TARGET OverFilter POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/logo_strip.png
         "$<TARGET_FILE_DIR:OverFilter>/../Resources/logo_strip.png"
+    COMMAND ${CMAKE_COMMAND}
+        -DOUTPUT_FILE=$<TARGET_FILE_DIR:OverFilter>/../Resources/build_info.txt
+        -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DCONFIG=$<CONFIG>
+        -DBUNDLE_BINARY=$<TARGET_FILE_NAME:OverFilter>
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/write_build_info.cmake"
     VERBATIM
 )

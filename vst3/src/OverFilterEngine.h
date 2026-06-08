@@ -29,6 +29,8 @@ public:
     void reset();
     void setFilterParams(int filterIndex, const FilterRuntimeParams& params);
     void setWetDry(double wetDry);
+    void setGlobalBypass(bool bypass);
+    void setOutputMute(bool mute);
 
     template <typename SampleType>
     void processBlock(SampleType** inputs, SampleType** outputs, int32_t numChannels, int32_t numSamples) {
@@ -62,6 +64,8 @@ private:
     double wetDryTarget_{1.0};
     double wetDryCurrent_{1.0};
     double wetDrySmoothingCoeff_{1.0};
+    bool globalBypass_{false};
+    bool outputMute_{false};
     uint32_t noiseState_{0x12345678u};
 };
 

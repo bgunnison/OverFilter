@@ -39,6 +39,8 @@ enum ParamIDs : Steinberg::Vst::ParamID {
 
 constexpr int kActiveParamBase = kParamBaseFilterParams + kMaxFilters * kPerFilterParams;
 constexpr Steinberg::Vst::ParamID kParamWetDry = static_cast<Steinberg::Vst::ParamID>(kActiveParamBase + kActiveParamCount);
+constexpr Steinberg::Vst::ParamID kParamGlobalBypass = static_cast<Steinberg::Vst::ParamID>(kParamWetDry + 1);
+constexpr Steinberg::Vst::ParamID kParamGlobalMute = static_cast<Steinberg::Vst::ParamID>(kParamWetDry + 2);
 
 inline Steinberg::Vst::ParamID filterParamId(int filterIndex, int paramSlot) {
     return static_cast<Steinberg::Vst::ParamID>(kParamBaseFilterParams + filterIndex * kPerFilterParams + paramSlot);

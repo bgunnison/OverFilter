@@ -42,7 +42,9 @@ constexpr int kActiveParamCount = 7;
 
 enum class TuningMode {
     FixedHz = 0,
-    Note = 1
+    Note = 1,
+    MidiNote = 2,
+    MidiChord = 3
 };
 
 constexpr double kMinFrequencyHz = 20.0;
@@ -56,11 +58,22 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr int kAbletonOctaveOffset = 2;
 
 inline TuningMode normalizedToMode(double normalized) {
-    return normalized >= 0.5 ? TuningMode::Note : TuningMode::FixedHz;
+    const double n = std::clamp(normalized, 0.0, 1.0);
+    if (n < (1.0 / 6.0)) return TuningMode::FixedHz;
+    if (n < 0.5) return TuningMode::Note;
+    if (n < (5.0 / 6.0)) return TuningMode::MidiNote;
+    return TuningMode::MidiChord;
 }
 
 inline double modeToNormalized(TuningMode mode) {
-    return mode == TuningMode::Note ? 1.0 : 0.0;
+    switch (mode) {
+        case TuningMode::Note: return 1.0 / 3.0;
+        case TuningMode::MidiNote: return 2.0 / 3.0;
+        case TuningMode::MidiChord: return 1.0;
+        case TuningMode::FixedHz:
+        default:
+            return 0.0;
+    }
 }
 
 inline double clamp01(double value) {
@@ -100,10 +113,9 @@ inline int frequencyToNearestMidiNote(double frequencyHz) {
 }
 
 inline double normalizedToFrequency(double modeNormalized, double tuneNormalized) {
-    if (normalizedToMode(modeNormalized) == TuningMode::Note) {
-        return midiNoteToFrequency(normalizedToMidiNote(tuneNormalized));
-    }
-    return normalizedToFixedFrequency(tuneNormalized);
+    return normalizedToMode(modeNormalized) == TuningMode::FixedHz
+        ? normalizedToFixedFrequency(tuneNormalized)
+        : midiNoteToFrequency(normalizedToMidiNote(tuneNormalized));
 }
 
 inline double normalizedToGainDb(double normalized) {
@@ -212,7 +224,7 @@ inline double defaultNormalized(int filterIndex, int slot) {
     filterIndex = std::clamp(filterIndex, 0, kMaxFilters - 1);
     switch (slot) {
         case kSlotMode:
-            return boolToNormalized(filterIndex >= 2 && filterIndex <= 7);
+            return modeToNormalized(filterIndex >= 2 && filterIndex <= 7 ? TuningMode::Note : TuningMode::FixedHz);
         case kSlotTune:
             if (filterIndex >= 2 && filterIndex <= 7) {
                 return midiNoteToNormalized(kNotes[static_cast<size_t>(filterIndex)]);

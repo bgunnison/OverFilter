@@ -6,27 +6,29 @@ The goal is to make a software Resonant Filterbank concept: tuned resonant bands
 
 ## Core Idea
 
-OverFilter lets users tune each resonant filter either by direct frequency or by musical note.
+OverFilter lets users tune each resonant filter by direct frequency, manual musical note, incoming MIDI note follow, or incoming MIDI chord allocation.
 
 This allows users to build harmonic resonator layouts manually. For example, a drum loop can be passed through filters tuned to `A2`, `C3`, `E3`, and `G3`, making the loop ring in an A minor shape.
 
-Switching tuning modes preserves the audible target: changing from `Note` to `Fixed Hz` converts the selected note into its exact frequency, and changing from `Fixed Hz` to `Note` snaps the tune value to the nearest note and displays the note name.
+Switching tuning modes preserves the audible target: changing from any note-based mode to `Fixed Hz` converts the selected note into its exact frequency, and changing from `Fixed Hz` to a note-based mode snaps the tune value to the nearest note and displays the note name.
 
 ## V1 Scope
 
 - Ten selectable stereo resonant filters.
 - Each filter has its own settings.
-- Each filter can use one of two tuning modes:
+- Each filter can use one of four tuning modes:
   - `Fixed Hz`: center frequency is edited directly in Hz.
   - `Note`: center frequency is selected as note name plus octave, such as `C2`, `F#3`, or `A4`.
+  - `MIDI Note`: center frequency follows every incoming MIDI note-on routed to the VST3.
+  - `MIDI Chord`: incoming held notes are distributed across free MIDI Chord filters until note-off releases them.
   - Note names follow Ableton Live's octave convention, where MIDI note 60 is `C3`.
 
 ## Per-Filter Controls
 
 Each numbered filter button selects one filter and exposes its controls:
 
-- `Mode`: `Fixed Hz` or `Note`.
-- `Tune`: frequency in Hz for fixed mode, or note plus octave for note mode.
+- `Mode`: `Fixed Hz`, `Note`, `MIDI Note`, or `MIDI Chord`.
+- `Tune`: frequency in Hz for fixed mode, or note plus octave for note-based modes.
 - `Gain`: center-detent band amount. Center is flat, positive values add the selected bandpass region, and negative values subtract it for band-reject/notch-like behavior. Tuning a filter to a note does not change the input by itself until `Gain` moves away from center or feedback is engaged.
 - `Q`: controls bandwidth and resonant sharpness for both boost and reject behavior. Feedback can emphasize resonance, but it should not replace the Q setting.
 - `Feedback`: amount of this filter sent into the feedback path.
@@ -35,11 +37,22 @@ Each numbered filter button selects one filter and exposes its controls:
 Global controls:
 
 - `Wet/Dry`: blends from dry input to the full OverFilter processed output. It is global and lives in the header area under the title.
+- `B`: bypasses the whole filterbank to dry audio.
+- `M`: mutes the plugin output.
 
 Per-filter toggles:
 
 - `B`: if selected bypasses the filter.
 - `F`: includes the filter in the feedback network.
+
+MIDI following:
+
+- `MIDI Note`: when a MIDI note-on arrives, every filter in `MIDI Note` mode retunes to that note.
+- If several filters are in `MIDI Note` mode, they follow the same incoming note together.
+- Note-offs do not change `MIDI Note` tuning; those filters stay at the last received note until the next note-on.
+- `MIDI Chord`: when a MIDI note-on arrives, the note is assigned to the next free `MIDI Chord` filter unless a filter already captured that note.
+- A `MIDI Chord` filter holds its assigned note until the matching note-off releases it.
+- Simultaneous notes are spread across available `MIDI Chord` filters.
 
 ## Phase And Summing
 
@@ -65,9 +78,9 @@ The UI should follow the foundation established by the Beat VST3:
 - A centered plugin title and `Select` button.
 - A PinchFX-style animated logo in the upper left with transparent background.
 - A widened editor with the filter select buttons evenly dispersed horizontally.
-- A persistent global `Wet/Dry` slider in the header to the right of the logo.
+- A persistent global `Wet/Dry` slider in the header to the right of the logo, with global `B` and `M` buttons nearby.
 - The per-filter sliders end-aligned with filter select button `10`.
-- A two-button exclusive mode selector labeled `Fixed Hz` and `Note`.
+- A four-button exclusive mode selector labeled `Fixed Hz`, `Note`, `MIDI Note`, and `MIDI Chord`.
 
 For OverFilter, the numbered slots represent filters `1-10`. Selecting a filter changes the visible control panel to that filter's settings.
 

@@ -8,12 +8,20 @@
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 
 #include <algorithm>
+#include <cmath>
+#ifdef OVERFILTER_DEBUG_NAME
+#include <fstream>
+#endif
 
 namespace overfilter {
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
 namespace {
+
+constexpr int32 kNoMidiPitch = -1;
+constexpr int32 kNoMidiNoteId = -1;
+constexpr int16 kNoMidiChannel = -1;
 
 void writeOutputSilence(ProcessData& data) {
     for (int32 bus = 0; bus < data.numOutputs; ++bus) {
@@ -38,6 +46,7 @@ OverFilterProcessor::OverFilterProcessor() {
     setControllerClass(kOverFilterControllerUID);
     setProcessing(true);
     buildParamOrder();
+    releaseAllMidiFilters();
 }
 
 tresult PLUGIN_API OverFilterProcessor::initialize(FUnknown* context) {
@@ -46,6 +55,7 @@ tresult PLUGIN_API OverFilterProcessor::initialize(FUnknown* context) {
 
     addAudioInput(STR16("Main In"), SpeakerArr::kStereo);
     addAudioOutput(STR16("Main Out"), SpeakerArr::kStereo);
+    addEventInput(STR16("MIDI In"), 1);
     return kResultOk;
 }
 
@@ -72,6 +82,7 @@ tresult PLUGIN_API OverFilterProcessor::setupProcessing(ProcessSetup& setup) {
 tresult PLUGIN_API OverFilterProcessor::setActive(TBool state) {
     if (state) {
         engine_.reset();
+        releaseAllMidiFilters();
     }
     return AudioEffect::setActive(state);
 }
@@ -96,11 +107,16 @@ void OverFilterProcessor::buildParamOrder() {
     paramState_[kParamFilterSelect] = 0.0;
     paramOrder_.push_back(kParamWetDry);
     paramState_[kParamWetDry] = 1.0;
+    paramOrder_.push_back(kParamGlobalBypass);
+    paramState_[kParamGlobalBypass] = 0.0;
+    paramOrder_.push_back(kParamGlobalMute);
+    paramState_[kParamGlobalMute] = 0.0;
 }
 
 ParamValue OverFilterProcessor::defaultNormalized(ParamID pid) const {
     if (pid == kParamFilterSelect) return 0.0;
     if (pid == kParamWetDry) return 1.0;
+    if (pid == kParamGlobalBypass || pid == kParamGlobalMute) return 0.0;
     if (pid >= kParamBaseFilterParams && pid < kActiveParamBase) {
         const int rel = static_cast<int>(pid - kParamBaseFilterParams);
         const int filter = rel / kPerFilterParams;
@@ -137,6 +153,18 @@ void OverFilterProcessor::applyNormalizedParam(ParamID pid, ParamValue value) {
         paramState_[pid] = clamp01(value);
         return;
     }
+    if (pid == kParamGlobalBypass) {
+        const bool enabled = normalizedToBool(value);
+        engine_.setGlobalBypass(enabled);
+        paramState_[pid] = boolToNormalized(enabled);
+        return;
+    }
+    if (pid == kParamGlobalMute) {
+        const bool enabled = normalizedToBool(value);
+        engine_.setOutputMute(enabled);
+        paramState_[pid] = boolToNormalized(enabled);
+        return;
+    }
     if (pid >= kActiveParamBase && pid < kActiveParamBase + kActiveParamCount) return;
     if (pid < kParamBaseFilterParams || pid >= kActiveParamBase) return;
 
@@ -150,10 +178,16 @@ void OverFilterProcessor::applyNormalizedParam(ParamID pid, ParamValue value) {
         const TuningMode previousMode = normalizedToMode(state[kSlotMode]);
         const TuningMode nextMode = normalizedToMode(value);
         if (previousMode != nextMode) {
-            if (previousMode == TuningMode::Note && nextMode == TuningMode::FixedHz) {
+            const auto isMidiMode = [](TuningMode mode) {
+                return mode == TuningMode::MidiNote || mode == TuningMode::MidiChord;
+            };
+            if (isMidiMode(previousMode) || isMidiMode(nextMode)) {
+                releaseMidiFilter(filter);
+            }
+            if (previousMode != TuningMode::FixedHz && nextMode == TuningMode::FixedHz) {
                 state[kSlotTune] = fixedFrequencyToNormalized(midiNoteToFrequency(normalizedToMidiNote(state[kSlotTune])));
                 paramState_[filterParamId(filter, kSlotTune)] = state[kSlotTune];
-            } else if (previousMode == TuningMode::FixedHz && nextMode == TuningMode::Note) {
+            } else if (previousMode == TuningMode::FixedHz && nextMode != TuningMode::FixedHz) {
                 state[kSlotTune] = midiNoteToNormalized(frequencyToNearestMidiNote(normalizedToFixedFrequency(state[kSlotTune])));
                 paramState_[filterParamId(filter, kSlotTune)] = state[kSlotTune];
             }
@@ -162,6 +196,225 @@ void OverFilterProcessor::applyNormalizedParam(ParamID pid, ParamValue value) {
 
     state[static_cast<size_t>(slot)] = clamp01(value);
     syncFilterConfig(filter);
+}
+
+bool OverFilterProcessor::isFilterInMidiNoteMode(int filterIndex) const {
+    if (filterIndex < 0 || filterIndex >= kMaxFilters) return false;
+    const auto& state = filterState_[static_cast<size_t>(filterIndex)];
+    return normalizedToMode(state[kSlotMode]) == TuningMode::MidiNote;
+}
+
+bool OverFilterProcessor::isFilterInMidiChordMode(int filterIndex) const {
+    if (filterIndex < 0 || filterIndex >= kMaxFilters) return false;
+    const auto& state = filterState_[static_cast<size_t>(filterIndex)];
+    return normalizedToMode(state[kSlotMode]) == TuningMode::MidiChord;
+}
+
+bool OverFilterProcessor::isFilterInAnyMidiMode(int filterIndex) const {
+    return isFilterInMidiNoteMode(filterIndex) || isFilterInMidiChordMode(filterIndex);
+}
+
+void OverFilterProcessor::releaseMidiFilter(int filterIndex) {
+    if (filterIndex < 0 || filterIndex >= kMaxFilters) return;
+    midiHeldPitch_[static_cast<size_t>(filterIndex)] = kNoMidiPitch;
+    midiHeldNoteId_[static_cast<size_t>(filterIndex)] = kNoMidiNoteId;
+    midiHeldChannel_[static_cast<size_t>(filterIndex)] = kNoMidiChannel;
+}
+
+void OverFilterProcessor::releaseAllMidiFilters() {
+    midiHeldPitch_.fill(kNoMidiPitch);
+    midiHeldNoteId_.fill(kNoMidiNoteId);
+    midiHeldChannel_.fill(kNoMidiChannel);
+    midiNextFilter_ = 0;
+}
+
+int OverFilterProcessor::findNextFreeMidiChordFilter() const {
+    for (int offset = 0; offset < kMaxFilters; ++offset) {
+        const int filter = (midiNextFilter_ + offset) % kMaxFilters;
+        if (!isFilterInMidiChordMode(filter)) continue;
+        if (midiHeldPitch_[static_cast<size_t>(filter)] == kNoMidiPitch) return filter;
+    }
+    return -1;
+}
+
+int OverFilterProcessor::findMidiChordFilterForNote(int32 pitch, int32 noteId, int16 channel) const {
+    if (noteId >= 0) {
+        for (int filter = 0; filter < kMaxFilters; ++filter) {
+            if (!isFilterInMidiChordMode(filter)) continue;
+            if (midiHeldNoteId_[static_cast<size_t>(filter)] == noteId &&
+                midiHeldChannel_[static_cast<size_t>(filter)] == channel) {
+                return filter;
+            }
+        }
+    }
+
+    for (int filter = 0; filter < kMaxFilters; ++filter) {
+        if (!isFilterInMidiChordMode(filter)) continue;
+        if (midiHeldPitch_[static_cast<size_t>(filter)] == pitch &&
+            midiHeldChannel_[static_cast<size_t>(filter)] == channel) {
+            return filter;
+        }
+    }
+
+    if (noteId >= 0) {
+        for (int filter = 0; filter < kMaxFilters; ++filter) {
+            if (!isFilterInMidiChordMode(filter)) continue;
+            if (midiHeldNoteId_[static_cast<size_t>(filter)] == noteId) {
+                return filter;
+            }
+        }
+    }
+
+    for (int filter = 0; filter < kMaxFilters; ++filter) {
+        if (!isFilterInMidiChordMode(filter)) continue;
+        if (midiHeldPitch_[static_cast<size_t>(filter)] == pitch) {
+            return filter;
+        }
+    }
+
+    return -1;
+}
+
+int OverFilterProcessor::findMidiChordFilterForNoteOff(int32 pitch, int32 noteId, int16 channel) const {
+    return findMidiChordFilterForNote(pitch, noteId, channel);
+}
+
+void OverFilterProcessor::emitParameterChange(IParameterChanges* outputChanges, ParamID pid,
+                                              ParamValue value, int32 sampleOffset) {
+    if (!outputChanges) return;
+    int32 queueIndex = 0;
+    IParamValueQueue* queue = outputChanges->addParameterData(pid, queueIndex);
+    if (!queue) return;
+    int32 pointIndex = 0;
+    queue->addPoint(sampleOffset, value, pointIndex);
+}
+
+int OverFilterProcessor::selectedFilterIndex() const {
+    const auto it = paramState_.find(kParamFilterSelect);
+    const double value = it == paramState_.end() ? 0.0 : it->second;
+    return std::clamp(static_cast<int>(std::round(clamp01(value) * (kMaxFilters - 1))), 0, kMaxFilters - 1);
+}
+
+void OverFilterProcessor::emitTuneChangeForFilter(int filterIndex, ParamValue value, int32 sampleOffset,
+                                                  IParameterChanges* outputChanges) {
+    emitParameterChange(outputChanges, filterParamId(filterIndex, kSlotTune), value, sampleOffset);
+    if (filterIndex == selectedFilterIndex()) {
+        emitParameterChange(outputChanges, activeParamId(kActiveTune), value, sampleOffset);
+    }
+}
+
+void OverFilterProcessor::debugLogMidiEvent(const char* label, int32 pitch, int32 noteId,
+                                            int16 channel, int assignedFilter) const {
+#ifdef OVERFILTER_DEBUG_NAME
+    std::ofstream log("C:\\projects\\ableplugs\\OverFilter\\overfilter_midi_debug.log", std::ios::app);
+    log << label
+        << " pitch=" << pitch
+        << " noteId=" << noteId
+        << " channel=" << channel
+        << " assigned=" << assignedFilter
+        << " next=" << midiNextFilter_;
+    for (int filter = 0; filter < kMaxFilters; ++filter) {
+        if (!isFilterInAnyMidiMode(filter)) continue;
+        const TuningMode mode = normalizedToMode(filterState_[static_cast<size_t>(filter)][kSlotMode]);
+        log << " f" << (filter + 1)
+            << ":mode=" << (mode == TuningMode::MidiChord ? "chord" : "note")
+            << ":held=" << midiHeldPitch_[static_cast<size_t>(filter)]
+            << "/id=" << midiHeldNoteId_[static_cast<size_t>(filter)]
+            << "/ch=" << midiHeldChannel_[static_cast<size_t>(filter)]
+            << "/note=" << normalizedToMidiNote(filterState_[static_cast<size_t>(filter)][kSlotTune]);
+    }
+    log << '\n';
+#else
+    (void)label;
+    (void)pitch;
+    (void)noteId;
+    (void)channel;
+    (void)assignedFilter;
+#endif
+}
+
+void OverFilterProcessor::handleNoteOn(int32 pitch, int32 noteId, int16 channel, int32 sampleOffset,
+                                       IParameterChanges* outputChanges) {
+    bool retunedAny = false;
+    int assignedChordFilter = -1;
+    const int safePitch = std::clamp(pitch, 0, 127);
+    const double normalizedNote = midiNoteToNormalized(safePitch);
+
+    for (int filter = 0; filter < kMaxFilters; ++filter) {
+        if (!isFilterInMidiNoteMode(filter)) continue;
+
+        auto& state = filterState_[static_cast<size_t>(filter)];
+        state[kSlotTune] = normalizedNote;
+        const ParamID tunePid = filterParamId(filter, kSlotTune);
+        paramState_[tunePid] = normalizedNote;
+        syncFilterConfig(filter);
+        emitTuneChangeForFilter(filter, normalizedNote, sampleOffset, outputChanges);
+        retunedAny = true;
+    }
+
+    const bool alreadyCaptured = findMidiChordFilterForNote(safePitch, noteId, channel) >= 0;
+    if (!alreadyCaptured) {
+        assignedChordFilter = findNextFreeMidiChordFilter();
+        if (assignedChordFilter >= 0) {
+            auto& state = filterState_[static_cast<size_t>(assignedChordFilter)];
+            state[kSlotTune] = normalizedNote;
+            const ParamID tunePid = filterParamId(assignedChordFilter, kSlotTune);
+            paramState_[tunePid] = normalizedNote;
+            midiHeldPitch_[static_cast<size_t>(assignedChordFilter)] = safePitch;
+            midiHeldNoteId_[static_cast<size_t>(assignedChordFilter)] = noteId;
+            midiHeldChannel_[static_cast<size_t>(assignedChordFilter)] = channel;
+            midiNextFilter_ = (assignedChordFilter + 1) % kMaxFilters;
+            syncFilterConfig(assignedChordFilter);
+            emitTuneChangeForFilter(assignedChordFilter, normalizedNote, sampleOffset, outputChanges);
+            retunedAny = true;
+        }
+    }
+
+    if (!retunedAny) {
+        debugLogMidiEvent("note_on_no_midi_filter", pitch, noteId, channel, -1);
+        return;
+    }
+
+    debugLogMidiEvent(alreadyCaptured ? "note_on_chord_already_held" : "note_on", pitch, noteId, channel,
+                      assignedChordFilter);
+}
+
+void OverFilterProcessor::handleNoteOff(int32 pitch, int32 noteId, int16 channel) {
+    const int filter = findMidiChordFilterForNoteOff(std::clamp(pitch, 0, 127), noteId, channel);
+    if (filter >= 0) {
+        releaseMidiFilter(filter);
+        midiNextFilter_ = filter;
+    }
+    debugLogMidiEvent("note_off", pitch, noteId, channel, filter);
+}
+
+void OverFilterProcessor::handleEvent(const Event& event, IParameterChanges* outputChanges) {
+    switch (event.type) {
+        case Event::kNoteOnEvent:
+            if (event.noteOn.velocity <= 0.0f) {
+                handleNoteOff(event.noteOn.pitch, event.noteOn.noteId, event.noteOn.channel);
+            } else {
+                handleNoteOn(event.noteOn.pitch, event.noteOn.noteId, event.noteOn.channel,
+                             event.sampleOffset, outputChanges);
+            }
+            break;
+        case Event::kNoteOffEvent:
+            handleNoteOff(event.noteOff.pitch, event.noteOff.noteId, event.noteOff.channel);
+            break;
+        default:
+            break;
+    }
+}
+
+void OverFilterProcessor::handleAllEvents(IEventList* events, IParameterChanges* outputChanges) {
+    if (!events) return;
+    const int32 eventCount = events->getEventCount();
+    Event event{};
+    for (int32 i = 0; i < eventCount; ++i) {
+        if (events->getEvent(i, event) == kResultOk) {
+            handleEvent(event, outputChanges);
+        }
+    }
 }
 
 void OverFilterProcessor::syncFilterConfig(int filterIndex) {
@@ -186,22 +439,30 @@ void OverFilterProcessor::syncAllFilters() {
 }
 
 tresult PLUGIN_API OverFilterProcessor::process(ProcessData& data) {
-    if (data.numOutputs == 0 || !data.outputs) return kResultOk;
+    if (data.numOutputs == 0 || !data.outputs) {
+        handleAllEvents(data.inputEvents, data.outputParameterChanges);
+        return kResultOk;
+    }
     for (int32 bus = 0; bus < data.numOutputs; ++bus) {
         data.outputs[bus].silenceFlags = 0;
     }
 
     handleParameterChanges(data);
-    if (data.numSamples <= 0) return kResultOk;
+    if (data.numSamples <= 0) {
+        handleAllEvents(data.inputEvents, data.outputParameterChanges);
+        return kResultOk;
+    }
 
     auto* mainIn = data.numInputs > 0 ? &data.inputs[0] : nullptr;
     if (!mainIn || mainIn->numChannels == 0) {
+        handleAllEvents(data.inputEvents, data.outputParameterChanges);
         writeOutputSilence(data);
         return kResultOk;
     }
 
     auto& outBus = data.outputs[0];
     if (outBus.numChannels != mainIn->numChannels) {
+        handleAllEvents(data.inputEvents, data.outputParameterChanges);
         writeOutputSilence(data);
         return kResultOk;
     }
@@ -217,14 +478,43 @@ tresult PLUGIN_API OverFilterProcessor::process(ProcessData& data) {
 }
 
 template <typename SampleType>
-void OverFilterProcessor::processAudio(ProcessData&, SampleType** inputs, SampleType** outputs,
+void OverFilterProcessor::processAudio(ProcessData& data, SampleType** inputs, SampleType** outputs,
                                        int32_t numChannels, int32_t numSamples) {
-    engine_.processBlock(inputs, outputs, numChannels, numSamples);
+    const int32 eventCount = data.inputEvents ? data.inputEvents->getEventCount() : 0;
+    int32 nextEvent = 0;
+    int32 sampleIndex = 0;
+    Event event{};
+    std::array<SampleType*, 2> inputChunk{};
+    std::array<SampleType*, 2> outputChunk{};
+
+    auto processRange = [&](int32 start, int32 count) {
+        if (count <= 0) return;
+        for (int32 channel = 0; channel < numChannels; ++channel) {
+            inputChunk[static_cast<size_t>(channel)] = inputs[channel] + start;
+            outputChunk[static_cast<size_t>(channel)] = outputs[channel] + start;
+        }
+        engine_.processBlock(inputChunk.data(), outputChunk.data(), numChannels, count);
+    };
+
+    while (nextEvent < eventCount) {
+        if (data.inputEvents->getEvent(nextEvent, event) != kResultOk) {
+            ++nextEvent;
+            continue;
+        }
+        const int32 offset = std::clamp(event.sampleOffset, sampleIndex, numSamples);
+        processRange(sampleIndex, offset - sampleIndex);
+        sampleIndex = offset;
+        handleEvent(event, data.outputParameterChanges);
+        ++nextEvent;
+    }
+
+    processRange(sampleIndex, numSamples - sampleIndex);
 }
 
 tresult PLUGIN_API OverFilterProcessor::setState(IBStream* state) {
     if (!state) return kResultFalse;
     IBStreamer streamer(state, kLittleEndian);
+    releaseAllMidiFilters();
     for (auto pid : paramOrder_) {
         double value = 0.0;
         if (!streamer.readDouble(value)) value = defaultNormalized(pid);
